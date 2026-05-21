@@ -1,6 +1,7 @@
 const express = require("express");
 const mysql = require("mysql2/promise");
 const { createClient } = require("redis");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json());
@@ -55,10 +56,12 @@ app.post("/init-db", async (req, res) => {
       CREATE TABLE IF NOT EXISTS tickets (
       id INT AUTO_INCREMENT PRIMARY KEY,
       event_id INT NOT NULL,
+      seat_number varchar(50),
       status ENUM('available', 'reserved', 'sold') DEFAULT 'available',
-      user_id VARCHAR(255),
+      reserved_by VARCHAR(255),
       reserved_at TIMESTAMP NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      sold_at TIMESTAMP NULL,
       FOREIGN KEY (event_id) REFERENCES events(id)
     )`);
 
@@ -73,10 +76,10 @@ app.post("/seed", async (req, res) => {
 
     const eventId = eventResult.insertId;
     
-    for (let i =0; i<100; i++) {
+    for (let i=1; i<=100; i++) {
         await db.execute(
-            "Insert into tickets (event_id, status) values (?, 'available')",
-            [eventId]
+            "Insert into tickets (event_id, seat_number, status) values (?, ?, 'available')",
+            [eventId, `A-${i}`]
         );
     }
 
@@ -103,10 +106,18 @@ app.get("/events/:id/availability", async (req, res) => {
 
 app.post("/events/:id/book", async (req, res) => {
     const eventId = req.params.id;
-    const { userId } = req.body;
+    const { userId, bookingToken } = req.body;
 
-    if (!userId) {
-        return res.status(400).json({ error: "userId is required"});
+    if (!userId || !bookingToken) {
+        return res.status(400).json({ error: "userId and bookingToken is required"});
+    }
+    const tokenKey = `booking_token:${eventId}:${userId}`;
+    const storedToken = await redisClient.get(tokenKey);
+
+    if (!storedToken || storedToken !== bookingToken) {
+        return res.status(403).json({
+            error: "Invalid or expired booking token"
+        });
     }
 
     const connection = await mysql.createConnection({
@@ -121,7 +132,7 @@ app.post("/events/:id/book", async (req, res) => {
         await connection.beginTransaction();
 
         const [tickets] = await connection.execute(
-            `SELECT id
+            `SELECT id, seat_number
             FROM tickets
             WHERE event_id = ? AND status = 'available'
             LIMIT 1
@@ -135,21 +146,26 @@ app.post("/events/:id/book", async (req, res) => {
                 error: "No tickets available"
             });
         }
-
-        const ticketId = tickets[0].id;
+        const ticket = tickets[0];
+        // const ticketId = tickets[0].id;
 
         await connection.execute(
             `UPDATE tickets
-            SET status = 'sold', user_id = ?
+            SET status = 'reserved', 
+                reserved_by = ?,
+                reserved_at = NOW()
             WHERE id = ?`,
-            [userId, ticketId]
+            [userId, ticket.id]
         );
 
         await connection.commit();
+        await redisClient.del(tokenKey);
 
         res.json({
             message: "Ticket booked successfully",
-            ticketId
+            ticketId: ticket.id,
+            seatNumber: ticket.seat_number,
+            reservedBy: userId
         });
     } catch (err) {
         await connection.rollback();
@@ -205,6 +221,106 @@ app.get("/events/:id/queue/position/:userId", async (req, res) => {
         userId,
         position: rank + 1
     });
+})
+
+
+app.post("/events/:id/queue/admit", async (req, res) => {
+    const eventId = req.params.id;
+    const { limit = 1 } = req.body;
+
+    const queueKey = `queue:event:${eventId}`;
+    const users = await redisClient.zRange(queueKey, 0, limit - 1);
+
+    if (users.length === 0) {
+        return res.status(404).json({ error: "Queue is empty"});
+    }
+
+    const admittedUsers = [];
+
+    for (const userId of users) {
+        const token = crypto.randomBytes(16).toString("hex");
+        const tokenKey = `booking_token:${eventId}:${userId}`;
+
+        await redisClient.set(tokenKey, token, {
+            EX: 60 
+        });
+
+        await redisClient.zRem(queueKey, userId);
+
+        admittedUsers.push({
+            userId,
+            bookingToken: token,
+            expiresInSeconds: 60 
+        });
+    }
+    res.json({
+        message: "Users admitted",
+        eventId,
+        admittedUsers
+    });
+});
+
+app.post("/events/:id/booking/confirm", async (req, res) => {
+    const eventId = req.params.id;
+    const { userId, ticketId } = req.body;
+    
+    if (!userId || !ticketId) {
+        return res.status(400).json({ error: "userId and ticketId are required"}); 
+    }
+
+    const connection = await mysql.createConnection({
+        host: "localhost",
+        port: 3307,
+        user: "root",
+        password: "password",
+        database: "ticket_system"
+    });
+
+    try {
+        await connection.beginTransaction();
+
+        const [tickets] = await connection.execute(
+            `SELECT id, status, reserved_by
+            FROM tickets
+            WHERE id = ? AND event_id = ?
+            FOR UPDATE`, 
+            [ticketId, eventId]
+        );
+        if (tickets.length === 0) {
+            await connection.rollback();
+            return res.status(404).json({ error: "Ticket not found"});
+        }
+
+        const ticket = tickets[0];
+
+        if (ticket.status !== "reserved" || ticket.reserved_by !== userId) {
+            await connection.rollback();
+            return res.status(409).json({
+                error: "Ticket is not reserved by the user"
+            });
+        }
+
+        await connection.execute(
+            `UPDATE tickets
+            SET status = 'sold',
+                sold_at = NOW()
+            WHERE id = ?`,
+            [ticketId]
+        );
+
+        await connection.commit();
+
+        res.json({
+            message: "Booking confirmed successfully",
+            ticketId,
+            userId
+        });
+    } catch (err) {
+        await connection.rollback();
+        res.status(500).json({ error: err.message });
+    } finally {
+        await connection.end();
+    }
 })
 
 init().then(() => {
