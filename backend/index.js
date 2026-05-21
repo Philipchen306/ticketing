@@ -25,6 +25,80 @@ async function init() {
   console.log("Connected to MySQL & Redis");
 }
 
+async function rateLimiter(req, res, next) {
+    const ip = req.headers["x-forwarded-for"] || req.ip;
+    const now = Date.now();
+    const windowMs = 10000; // 10 sec
+    const maxRequests = 200;
+
+    const key = `rate_limit:${ip}`;
+
+    await redisClient.zRemRangeByScore(key, 0, now - windowMs);
+
+    await redisClient.zAdd(key, [{ score: now, value: `${now}-${Math.random()}`}]);
+    await redisClient.expire(key, Math.ceil(windowMs / 1000));
+
+    const count = await redisClient.zCard(key);
+
+    if (count > maxRequests) {
+        return res.status(429).json({ error: "Too many requests", count});
+    }
+    next();
+}
+
+async function antiBot(req, res, next) {
+    const userId = req.body.userId || req.params.userId || "anonymous";
+    const ip = req.headers["x-forwarded-for"] || req.ip;
+    const userAgent = req.headers["user-agent"] || "unknown";
+    const deviceId = req.headers["x-device-id"] || "unknown";
+
+    let riskScore = 0;
+
+    // IP requeest count
+    const ipKey = `rate:ip:${ip}`;
+    const ipCount = await redisClient.incr(ipKey);
+    if (ipCount === 1) await redisClient.expire(ipKey, 10);
+    if (ipCount > 20) riskScore += 30;
+
+    // User request count
+    const userKey = `rate:user:${userId}`;
+    const userCount = await redisClient.incr(userKey);
+    if (userCount === 1) await redisClient.expire(userKey, 10);
+    if (userCount > 5) riskScore += 30;
+
+    // Device fingerprint
+    const fingerprint = `${userAgent}:${deviceId}`;
+    const fpKey = `fingerprint:${userId}`;
+    const existingFp = await redisClient.get(fpKey);
+
+    if (!existingFp) {
+        await redisClient.set(fpKey, fingerprint, {EX: 3600});
+    } else if (existingFp !== fingerprint) {
+        riskScore += 20;
+    }
+
+    // Session age
+    const sessionKey = `session_start:${userId}`;
+    const sessionStart = await redisClient.get(sessionKey);
+
+    if (!sessionStart) {
+        await redisClient.set(sessionKey, Date.now().toString(), { EX: 3600 });
+    } else {
+        const ageMs = Date.now() - Number(sessionStart);
+        if (ageMs < 2000) riskScore += 10;
+    }
+
+    if (riskScore >= 60) {
+        return res.status(429).json({
+        error: "Request blocked due to suspicious behavior",
+        riskScore
+        });
+    }
+
+    req.riskScore = riskScore;
+    next();
+}
+
 // Test -------------------------------
 app.get("/health", async (req, res) => {
   res.send("OK");
@@ -68,22 +142,41 @@ app.post("/init-db", async (req, res) => {
     res.json({ message: "Database initialized" });
 });
 
-app.post("/seed", async (req, res) => {
+app.post("/events", async (req, res) => {
+    const {
+        name, 
+        venue, 
+        eventTime,
+        ticketCount
+    } = req.body;
+
+    if (!name || !venue || !eventTime || !ticketCount) {
+        return res.status(400).json({
+            error: "Missing required fields"
+        });
+    }
     const [eventResult] = await db.execute(
-        "Insert into events (name, venue, event_time) values (?, ?, ?)",
-        ["Twice", "Taipei Dome", "2026-08-01 19:30:00"]
+        `INSERT INTO events (name, venue, event_time)
+        VALUES (?, ?, ?)`,
+        [name, venue, eventTime]
     );
 
-    const eventId = eventResult.insertId;
-    
-    for (let i=1; i<=100; i++) {
+     const eventId = eventResult.insertId;
+
+    for (let i = 1; i <= ticketCount; i++) {
         await db.execute(
-            "Insert into tickets (event_id, seat_number, status) values (?, ?, 'available')",
-            [eventId, `A-${i}`]
+        `INSERT INTO tickets
+        (event_id, seat_number, status)
+        VALUES (?, ?, 'available')`,
+        [eventId, `A-${i}`]
         );
     }
 
-    res.json({ message: "Seed data created", eventId });
+    res.json({
+        message: "Event created successfully",
+        eventId,
+        ticketCount
+    });
 });
 
 app.get("/events", async (req, res) => {
@@ -104,7 +197,7 @@ app.get("/events/:id/availability", async (req, res) => {
     res.json(rows);
 });
 
-app.post("/events/:id/book", async (req, res) => {
+app.post("/events/:id/book", rateLimiter, antiBot, async (req, res) => {
     const eventId = req.params.id;
     const { userId, bookingToken } = req.body;
 
@@ -178,7 +271,7 @@ app.post("/events/:id/book", async (req, res) => {
     }
 });
 
-app.post("/events/:id/queue/join", async(req, res) => {
+app.post("/events/:id/queue/join", rateLimiter, antiBot,  async(req, res) => {
     const eventId = req.params.id;
     const { userId } = req.body;
 
@@ -199,7 +292,7 @@ app.post("/events/:id/queue/join", async(req, res) => {
     const rank = await redisClient.zRank(queueKey, userId);
 
     res.json({
-        messagee: "Joined queue",
+        message: "Joined queue",
         eventId,
         userId, 
         position: rank + 1
@@ -323,8 +416,12 @@ app.post("/events/:id/booking/confirm", async (req, res) => {
     }
 })
 
+
+
 init().then(() => {
-  app.listen(3000, () => {
+    // app.use(rateLimiter);
+
+    app.listen(3000, () => {
     console.log("Server running on port 3000");
   });
 });
