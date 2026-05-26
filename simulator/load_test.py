@@ -5,9 +5,9 @@ import statistics
 from collections import Counter
 
 BASE_URL = "http://localhost:3000"
-EVENT_ID = 2
+EVENT_ID = 3
 
-TOTAL_USERS = 200
+TOTAL_USERS = 250
 ADMIT_LIMIT = 10
 
 # Options:
